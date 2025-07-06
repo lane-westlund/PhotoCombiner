@@ -41,6 +41,8 @@ android {
 
 dependencies {
 
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
+
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3") // Or the latest version
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3") // Or the latest version
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.1") // Often used for viewModelScope
@@ -53,6 +55,7 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation(libs.androidx.exifinterface)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

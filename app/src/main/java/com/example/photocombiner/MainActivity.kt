@@ -60,6 +60,12 @@ import kotlin.ranges.coerceIn
 import kotlin.text.all
 import kotlin.text.first
 import kotlinx.coroutines.delay
+import androidx.exifinterface.media.ExifInterface // Add this import
+import java.io.IOException // Add this import if not already present
+import kotlin.io.path.getAttribute
+import kotlin.io.path.setAttribute
+import android.os.ParcelFileDescriptor // Ensure this is imported
+import java.io.FileInputStream // For copying
 
 
 class MainActivity : ComponentActivity() {
@@ -160,7 +166,9 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
     // averageImageChecked/medianImageChecked become false.
 
     Column(
-        modifier = modifier.fillMaxSize().padding(16.dp),
+        modifier = modifier
+            .fillMaxSize()
+            .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -227,6 +235,7 @@ suspend fun processImages(
         onProgressUpdate(1f) // Indicate completion (or error state)
         return
     }
+    val firstImageUriForExif: Uri? = uris.firstOrNull()
 
     // Load bitmaps from URIs
     val bitmaps: List<Bitmap> = uris.mapNotNull { uri ->
@@ -284,7 +293,7 @@ suspend fun processImages(
         }
         Log.d("ImageProcessing", "Average image calculation complete.")
         val displayName = "averaged_image_${System.currentTimeMillis()}.jpg"
-        saveBitmap(context, resultBitmap, displayName, "image/jpeg", "_average")
+        saveBitmap(context, resultBitmap, displayName, "image/jpeg", "_average", firstImageUriForExif)
         // resultBitmap.recycle()
     }
 
@@ -338,7 +347,7 @@ suspend fun processImages(
         }
         Log.d("ImageProcessing", "Median image calculation complete.")
         val displayNameMedian = "median_image_${System.currentTimeMillis()}.jpg"
-        saveBitmap(context, medianResultBitmap, displayNameMedian, "image/jpeg", "_median")
+        saveBitmap(context, medianResultBitmap, displayNameMedian, "image/jpeg", "_median", firstImageUriForExif)
         // medianResultBitmap.recycle()
     }
 
@@ -350,56 +359,185 @@ suspend fun processImages(
     Log.d("ImageProcessing", "Current processing step finished.")
 }
 
-// Helper function to save a bitmap
 private fun saveBitmap(
     context: Context,
     bitmap: Bitmap,
     displayName: String,
     mimeType: String,
-    suffix: String // e.g., "_average" or "_median"
+    suffix: String,
+    originalUriForExif: Uri? = null // New parameter to receive the URI of the first image
 ) {
-    val outputStream: OutputStream?
     val fileNameWithSuffix = displayName.substringBeforeLast(".") + suffix + "." + displayName.substringAfterLast(".")
+    var imageUri: Uri? = null // To hold the URI of the saved file, useful for EXIF writing
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        // For Android 10 (API 29) and above, use MediaStore
         val contentValues = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileNameWithSuffix)
             put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-            // Put in the Pictures directory
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + File.separator + "PhotoCombiner") // Optional: sub-folder
+            put(MediaStore.MediaColumns.IS_PENDING, 1) // Set as pending
         }
+        val resolver = context.contentResolver
+        try {
+            imageUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+            imageUri?.let { uri ->
+                resolver.openOutputStream(uri).use { outputStream ->
+                    if (outputStream == null) throw IOException("Failed to get output stream for MediaStore.")
+                    val format = if (mimeType.equals("image/png", ignoreCase = true)) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+                    bitmap.compress(format, 95, outputStream)
+                }
 
-        val imageUri: Uri? =
-            context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-        outputStream = imageUri?.let { context.contentResolver.openOutputStream(it) }
+                // --- Copy EXIF data AFTER bitmap is compressed and stream is closed ---
+                if (originalUriForExif != null && mimeType.equals("image/jpeg", ignoreCase = true)) {
+                    Log.d("ImageProcessing", "DOING EXIF COPY")
+                    copyExifData(context, originalUriForExif, uri)
+                } else {
+                    Log.d("ImageProcessing", "SKIPPING EXIF COPY")
+                }
+                // --- End EXIF Copy ---
+
+                contentValues.clear()
+                contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                resolver.update(uri, contentValues, null, null)
+                Log.d("ImageProcessing", "Image saved successfully to $uri")
+            } ?: Log.e("ImageProcessing", "MediaStore.insert() returned null URI.")
+
+        } catch (e: Exception) {
+            Log.e("ImageProcessing", "Error saving image with MediaStore: ${e.message}", e)
+            imageUri?.let { resolver.delete(it, null, null) } // Clean up pending entry if error
+        }
     } else {
-        // For older versions (below Android 10), save to external storage directly
-        // Make sure you have WRITE_EXTERNAL_STORAGE permission for API < 29
-        val imagesDir =
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+        // For older versions (below Android 10)
+        val imagesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES + File.separator + "PhotoCombiner")
         if (!imagesDir.exists()) {
-            imagesDir.mkdirs() // Create the directory if it doesn't exist
+            imagesDir.mkdirs()
         }
         val imageFile = File(imagesDir, fileNameWithSuffix)
-        outputStream = FileOutputStream(imageFile)
-    }
-
-    outputStream?.use {
         try {
-            // Compress and save bitmap
-            // Adjust quality as needed (0-100 for JPEG)
-            val format = if (mimeType.equals("image/png", ignoreCase = true)) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
-            bitmap.compress(format, 95, it)
-            Log.d("ImageProcessing", "Image saved successfully to $fileNameWithSuffix")
-            // TODO: Add user feedback (e.g., Toast message)
+            FileOutputStream(imageFile).use { outputStream ->
+                val format = if (mimeType.equals("image/png", ignoreCase = true)) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+                bitmap.compress(format, 95, outputStream)
+            }
+            Log.d("ImageProcessing", "Image saved successfully to ${imageFile.absolutePath}")
+
+            // --- Copy EXIF data AFTER bitmap is compressed and stream is closed ---
+            // For file paths, ExifInterface can work directly with the path.
+            if (originalUriForExif != null && mimeType.equals("image/jpeg", ignoreCase = true)) {
+                // We need an InputStream for the source, but can use the file path for the destination.
+                copyExifData(context, originalUriForExif, Uri.fromFile(imageFile), isFilePathDestination = true, destFilePath = imageFile.absolutePath)
+            }
+            // --- End EXIF Copy ---
+
         } catch (e: Exception) {
-            Log.e("ImageProcessing", "Error saving image: ${e.message}", e)
-            // TODO: Add user feedback for error
+            Log.e("ImageProcessing", "Error saving image to file: ${e.message}", e)
         }
-    } ?: run {
-        Log.e("ImageProcessing", "Could not get OutputStream to save image.")
-        // TODO: Add user feedback for error
+    }
+}
+
+// Helper function to copy EXIF data
+private fun copyExifData(
+    context: Context,
+    sourceUri: Uri,
+    destinationUri: Uri,
+    isFilePathDestination: Boolean = false,
+    destFilePath: String? = null
+) {
+    Log.d("ExifCopy", "Attempting EXIF copy. Source: $sourceUri, Dest: $destinationUri")
+
+    try {
+        val sourceExif: ExifInterface
+        context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
+            sourceExif = ExifInterface(inputStream)
+        } ?: run {
+            Log.e("ExifCopy", "Failed to open InputStream for source URI: $sourceUri. Cannot copy EXIF.")
+            return
+        }
+
+        // Define the list of EXIF attributes you want to copy
+        // Keep this list comprehensive for the data you care about.
+        val attributesToCopy = listOf(
+            ExifInterface.TAG_DATETIME,
+            ExifInterface.TAG_DATETIME_ORIGINAL,
+            ExifInterface.TAG_DATETIME_DIGITIZED,
+            ExifInterface.TAG_MAKE,
+            ExifInterface.TAG_MODEL,
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.TAG_F_NUMBER,
+            ExifInterface.TAG_ISO_SPEED_RATINGS,
+            ExifInterface.TAG_EXPOSURE_TIME,
+            ExifInterface.TAG_FLASH,
+            ExifInterface.TAG_FOCAL_LENGTH,
+            ExifInterface.TAG_IMAGE_WIDTH,
+            ExifInterface.TAG_IMAGE_LENGTH,
+            ExifInterface.TAG_GPS_LATITUDE,
+            ExifInterface.TAG_GPS_LATITUDE_REF,
+            ExifInterface.TAG_GPS_LONGITUDE,
+            ExifInterface.TAG_GPS_LONGITUDE_REF,
+            ExifInterface.TAG_GPS_ALTITUDE,
+            ExifInterface.TAG_GPS_ALTITUDE_REF,
+            ExifInterface.TAG_GPS_TIMESTAMP,
+            ExifInterface.TAG_GPS_DATESTAMP,
+            ExifInterface.TAG_GPS_PROCESSING_METHOD,
+            ExifInterface.TAG_GPS_SPEED,
+            ExifInterface.TAG_GPS_SPEED_REF,
+            ExifInterface.TAG_GPS_TRACK,
+            ExifInterface.TAG_GPS_TRACK_REF,
+            ExifInterface.TAG_GPS_IMG_DIRECTION,
+            ExifInterface.TAG_GPS_IMG_DIRECTION_REF,
+            ExifInterface.TAG_GPS_DEST_LATITUDE,
+            ExifInterface.TAG_GPS_DEST_LATITUDE_REF,
+            ExifInterface.TAG_GPS_DEST_LONGITUDE,
+            ExifInterface.TAG_GPS_DEST_LONGITUDE_REF
+            // Add or remove tags as needed
+        )
+
+        val setAttributeAction: (destinationExif: ExifInterface) -> Unit = { destinationExif ->
+            attributesToCopy.forEach { tag ->
+                try {
+                    sourceExif.getAttribute(tag)?.let { value ->
+                        destinationExif.setAttribute(tag, value)
+                    }
+                } catch (e: Exception) {
+                    // Log specific errors during attribute setting if necessary,
+                    // but often ExifInterface handles individual tag errors silently.
+                    // Log.w("ExifCopy", "Could not set attribute $tag: ${e.message}")
+                }
+            }
+        }
+
+        if (isFilePathDestination && destFilePath != null) {
+            val destinationExifInterface = ExifInterface(destFilePath)
+            setAttributeAction(destinationExifInterface)
+            destinationExifInterface.saveAttributes()
+            Log.d("ExifCopy", "EXIF data successfully copied to file path: $destFilePath")
+        } else {
+            // For Android Q+ (API 29+) using MediaStore URI with temporary file strategy
+            val tempFile = File.createTempFile("exif_temp_", ".jpg", context.cacheDir)
+            try {
+                context.contentResolver.openInputStream(destinationUri)?.use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        input.copyTo(output)
+                    }
+                } ?: throw IOException("Could not open input stream for destination URI $destinationUri for temp copy.")
+
+                val tempExifInterface = ExifInterface(tempFile.absolutePath)
+                setAttributeAction(tempExifInterface)
+                tempExifInterface.saveAttributes()
+
+                context.contentResolver.openOutputStream(destinationUri, "wt")?.use { output -> // "wt" for write, truncate
+                    FileInputStream(tempFile).use { input ->
+                        input.copyTo(output)
+                    }
+                } ?: throw IOException("Could not open output stream for destination URI $destinationUri to write back modified content.")
+                Log.d("ExifCopy", "EXIF data successfully processed for MediaStore URI: $destinationUri")
+            } finally {
+                if (tempFile.exists()) {
+                    tempFile.delete()
+                }
+            }
+        }
+    } catch (e: Exception) {
+        Log.e("ExifCopy", "Major error during EXIF copy operation: ${e.message}", e)
     }
 }
 
