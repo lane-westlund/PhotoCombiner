@@ -42,7 +42,7 @@ android {
 dependencies {
 
     implementation("androidx.exifinterface:exifinterface:1.3.7")
-
+    implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3") // Or the latest version
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3") // Or the latest version
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.1") // Often used for viewModelScope

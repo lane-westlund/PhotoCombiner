@@ -65,7 +65,15 @@ import java.io.IOException // Add this import if not already present
 import kotlin.io.path.getAttribute
 import kotlin.io.path.setAttribute
 import android.os.ParcelFileDescriptor // Ensure this is imported
+import androidx.compose.runtime.LaunchedEffect
 import java.io.FileInputStream // For copying
+import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import androidx.compose.runtime.DisposableEffect
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import android.widget.Toast // For showing error messages
+import androidx.activity.result.launch
 
 
 class MainActivity : ComponentActivity() {
@@ -88,82 +96,110 @@ class MainActivity : ComponentActivity() {
 fun PhotoCombinerApp(modifier: Modifier = Modifier) {
     var averageImageChecked by remember { mutableStateOf(false) }
     var medianImageChecked by remember { mutableStateOf(false) }
-    var isProcessing by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf(0f) }
-    var processingStage by remember { mutableStateOf<String?>(null) }
+    var isServiceProcessing by remember { mutableStateOf(false) }
+    var selectedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
 
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+
+    // BroadcastReceiver to listen for service completion
+    val processingStateReceiver = remember {
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                Log.d("PhotoCombinerApp", "Received broadcast: ${intent?.action}")
+                when (intent?.action) {
+                    ImageProcessingService.BROADCAST_PROCESSING_COMPLETE -> {
+                        isServiceProcessing = false
+                        // Optionally reset checkboxes or show a success message
+                        Toast.makeText(context, "Processing complete!", Toast.LENGTH_SHORT).show()
+                        // Reset checkboxes if desired for a full UI reset
+                        // averageImageChecked = false
+                        // medianImageChecked = false
+                        selectedUris = emptyList() // Clear selected URIs
+                    }
+                    ImageProcessingService.BROADCAST_PROCESSING_ERROR -> {
+                        isServiceProcessing = false
+                        val errorMessage = intent.getStringExtra(ImageProcessingService.EXTRA_ERROR_MESSAGE)
+                        Toast.makeText(context, "Processing error: $errorMessage", Toast.LENGTH_LONG).show()
+                        selectedUris = emptyList() // Clear selected URIs
+                    }
+                }
+            }
+        }
+    }
+
+    // Register and unregister the receiver using DisposableEffect
+    DisposableEffect(Unit) {
+        val intentFilter = IntentFilter().apply {
+            addAction(ImageProcessingService.BROADCAST_PROCESSING_COMPLETE)
+            addAction(ImageProcessingService.BROADCAST_PROCESSING_ERROR)
+        }
+        LocalBroadcastManager.getInstance(context).registerReceiver(processingStateReceiver, intentFilter)
+        Log.d("PhotoCombinerApp", "BroadcastReceiver registered.")
+
+        onDispose {
+            LocalBroadcastManager.getInstance(context).unregisterReceiver(processingStateReceiver)
+            Log.d("PhotoCombinerApp", "BroadcastReceiver unregistered.")
+        }
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(), // Explicitly state the contract
+        onResult = { isGranted: Boolean -> // Explicitly type the lambda parameter
+            if (isGranted) {
+                Log.d("PhotoCombinerApp", "POST_NOTIFICATIONS permission granted.")
+                // If URIs were selected (meaning picker ran, then permission was asked),
+                // and now granted, start service.
+                if (selectedUris.isNotEmpty() && (averageImageChecked || medianImageChecked)) {
+                    startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
+                    isServiceProcessing = true // Service is definitely starting or attempting to
+                } else {
+                    // This case might occur if permission was requested for some other reason
+                    // or if the state changed before service could start.
+                    Log.w("PhotoCombinerApp", "Permission granted, but selectedUris is empty or no processing type. Not starting service.")
+                    // isServiceProcessing should ideally not have been set to true if we reached here without starting.
+                }
+            } else {
+                Log.w("PhotoCombinerApp", "POST_NOTIFICATIONS permission denied.")
+                isServiceProcessing = false // Crucial: update state if permission denied and service won't start
+                Toast.makeText(context, "Notification permission denied. Processing cannot start.", Toast.LENGTH_LONG).show()
+            }
+        }
+    )
+
 
     val pickMultipleMedia =
-        rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(500)) { uris ->
-            if (uris.isNotEmpty()) {
+        rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.PickMultipleVisualMedia(500)
+        ) { urisFromPicker: List<Uri>? ->
+            // ... (your pickMultipleMedia logic as discussed before) ...
+            if (!urisFromPicker.isNullOrEmpty()) {
+                selectedUris = urisFromPicker
+
                 if (!averageImageChecked && !medianImageChecked) {
                     Log.i("PhotoCombinerApp", "No processing type selected.")
                     return@rememberLauncherForActivityResult
                 }
 
-                scope.launch {
-                    isProcessing = true
-                    progress = 0f // Reset overall progress
-
-                    try {
-                        if (averageImageChecked) {
-                            processingStage = "average_processing"
-                            Log.d("PhotoCombinerApp", "Starting Average processing stage.")
-                            withContext(Dispatchers.IO) {
-                                processImages(
-                                    context = context,
-                                    uris = uris,
-                                    processAverage = true,
-                                    processMedian = false
-                                ) { p -> scope.launch(Dispatchers.Main) { progress = p } }
-                            }
-                            Log.d("PhotoCombinerApp", "Average processing stage complete.")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    when (context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)) {
+                        android.content.pm.PackageManager.PERMISSION_GRANTED -> {
+                            startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
+                            isServiceProcessing = true
                         }
-
-                        if (medianImageChecked) {
-                            processingStage = if (averageImageChecked) "average_done_median_processing" else "median_processing"
-                            Log.d("PhotoCombinerApp", "Starting Median processing stage.")
-                            progress = 0f // Reset progress for the median stage
-                            withContext(Dispatchers.IO) {
-                                processImages(
-                                    context = context,
-                                    uris = uris,
-                                    processAverage = false,
-                                    processMedian = true
-                                ) { p -> scope.launch(Dispatchers.Main) { progress = p } }
-                            }
-                            Log.d("PhotoCombinerApp", "Median processing stage complete.")
+                        else -> {
+                            // Only set isServiceProcessing to true IF we know we are trying to start
+                            // The actual start will happen in notificationPermissionLauncher callback
+                            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
                         }
-                        processingStage = "all_done" // All selected operations are finished
-                    } catch (e: Exception) {
-                        Log.e("ImageProcessing", "Error during sequential processing: ${e.message}", e)
-                        processingStage = "error" // You can have specific UI for error if needed
-                    } finally {
-                        isProcessing = false // Stop showing "Processing..." on button
-                        progress = 0f // Reset progress bar/value
-
-                        // Optional: Short delay to allow user to see "Done" or "Error" state
-                        if (processingStage == "all_done" || processingStage == "error") {
-                            delay(2000) // Delay for 2 seconds
-                        }
-
-                        // Reset UI to initial state
-                        processingStage = null
-                        averageImageChecked = false
-                        medianImageChecked = false
                     }
+                } else {
+                    startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
+                    isServiceProcessing = true
                 }
             } else {
-                Log.d("PhotoPicker", "No media selected")
+                selectedUris = emptyList()
             }
         }
-
-    // ... (Column and UI layout remains the same as your last version) ...
-    // The Text composables for averageText and medianText will automatically
-    // revert to their default state when processingStage becomes null and
-    // averageImageChecked/medianImageChecked become false.
 
     Column(
         modifier = modifier
@@ -172,52 +208,64 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        // Average Image Row
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = averageImageChecked,
-                onCheckedChange = { if (!isProcessing) averageImageChecked = it },
-                enabled = !isProcessing
+                onCheckedChange = { if (!isServiceProcessing) averageImageChecked = it },
+                enabled = !isServiceProcessing
             )
             Spacer(modifier = Modifier.width(8.dp))
-            val averageText = when (processingStage) {
-                "average_processing" -> "Average Image (${(progress * 100).roundToInt()}%)"
-                "average_done_median_processing", "all_done" -> if (averageImageChecked) "Average Image (Done)" else "Average Image"
-                "error" -> if (averageImageChecked) "Average Image (Error)" else "Average Image" // Example error display
-                else -> "Average Image"
-            }
-            val averageColor = if (isProcessing && averageImageChecked && processingStage != "average_processing" && processingStage != null) Color.Gray else Color.Unspecified
-            Text(averageText, color = averageColor)
+            Text("Average Image")
         }
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Median Image Row
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = medianImageChecked,
-                onCheckedChange = { if (!isProcessing) medianImageChecked = it },
-                enabled = !isProcessing
+                onCheckedChange = { if (!isServiceProcessing) medianImageChecked = it },
+                enabled = !isServiceProcessing
             )
             Spacer(modifier = Modifier.width(8.dp))
-            val medianText = when (processingStage) {
-                "average_processing" -> if (medianImageChecked) "Median Image (Pending)" else "Median Image"
-                "median_processing", "average_done_median_processing" -> "Median Image (${(progress * 100).roundToInt()}%)"
-                "all_done" -> if (medianImageChecked) "Median Image (Done)" else "Median Image"
-                "error" -> if (medianImageChecked) "Median Image (Error)" else "Median Image" // Example error display
-                else -> "Median Image"
-            }
-            val medianColor = if (isProcessing && medianImageChecked && (processingStage == "average_processing" || (processingStage != "median_processing" && processingStage != "average_done_median_processing" && processingStage != null))) Color.Gray else Color.Unspecified
-            Text(medianText, color = medianColor)
+            Text("Median Image")
         }
         Spacer(modifier = Modifier.height(16.dp))
 
         Button(
-            onClick = { pickMultipleMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-            enabled = !isProcessing && (averageImageChecked || medianImageChecked) // Also re-enable based on new checkbox states
+            onClick = {
+                pickMultipleMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+            enabled = !isServiceProcessing && (averageImageChecked || medianImageChecked)
         ) {
-            Text(if (isProcessing) "Processing..." else "Load Images") // Button text will also reset due to isProcessing
+            Text(if (isServiceProcessing) "Processing in Background..." else "Load Images & Start Processing")
+        }
+
+        if (isServiceProcessing) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text("Check notification for progress.", color = Color.Gray)
         }
     }
+}
+
+
+// Helper function to start the service
+private fun startImageProcessingService(
+    context: Context,
+    imageUris: List<Uri>,
+    processAverage: Boolean,
+    processMedian: Boolean
+) {
+    val intent = Intent(context, ImageProcessingService::class.java).apply {
+        action = ImageProcessingService.ACTION_START_PROCESSING
+        putStringArrayListExtra(ImageProcessingService.EXTRA_IMAGE_URIS, ArrayList(imageUris.map { it.toString() }))
+        putExtra(ImageProcessingService.EXTRA_PROCESS_AVERAGE, processAverage)
+        putExtra(ImageProcessingService.EXTRA_PROCESS_MEDIAN, processMedian)
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        context.startForegroundService(intent)
+    } else {
+        context.startService(intent)
+    }
+    Log.d("PhotoCombinerApp", "Attempted to start ImageProcessingService.")
 }
 
 suspend fun processImages(
@@ -463,7 +511,6 @@ private fun copyExifData(
             ExifInterface.TAG_MODEL,
             ExifInterface.TAG_ORIENTATION,
             ExifInterface.TAG_F_NUMBER,
-            ExifInterface.TAG_ISO_SPEED_RATINGS,
             ExifInterface.TAG_EXPOSURE_TIME,
             ExifInterface.TAG_FLASH,
             ExifInterface.TAG_FOCAL_LENGTH,
