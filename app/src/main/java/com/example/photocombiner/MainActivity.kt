@@ -68,6 +68,12 @@ import android.os.ParcelFileDescriptor // Ensure this is imported
 import androidx.compose.runtime.LaunchedEffect
 import java.io.FileInputStream // For copying
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import androidx.compose.runtime.DisposableEffect
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import android.widget.Toast // For showing error messages
+import androidx.activity.result.launch
 
 
 class MainActivity : ComponentActivity() {
@@ -91,75 +97,109 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
     var averageImageChecked by remember { mutableStateOf(false) }
     var medianImageChecked by remember { mutableStateOf(false) }
     var isServiceProcessing by remember { mutableStateOf(false) }
-
-    // State to hold the URIs selected by the Photo Picker
-    var selectedUris by remember { mutableStateOf<List<Uri>>(emptyList()) } // <--- NEW STATE
+    var selectedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
 
     val context = LocalContext.current
 
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted: Boolean ->
-        if (isGranted) {
-            Log.d("PhotoCombinerApp", "POST_NOTIFICATIONS permission granted.")
-            // If URIs were selected before permission was asked, and now granted, start service
-            if (selectedUris.isNotEmpty() && (averageImageChecked || medianImageChecked)) {
-                Log.d("PhotoCombinerApp", "Timestamp PRE startForegroundService: ${System.currentTimeMillis()}")
-                startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
-                isServiceProcessing = true
+    // BroadcastReceiver to listen for service completion
+    val processingStateReceiver = remember {
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                Log.d("PhotoCombinerApp", "Received broadcast: ${intent?.action}")
+                when (intent?.action) {
+                    ImageProcessingService.BROADCAST_PROCESSING_COMPLETE -> {
+                        isServiceProcessing = false
+                        // Optionally reset checkboxes or show a success message
+                        Toast.makeText(context, "Processing complete!", Toast.LENGTH_SHORT).show()
+                        // Reset checkboxes if desired for a full UI reset
+                        // averageImageChecked = false
+                        // medianImageChecked = false
+                        selectedUris = emptyList() // Clear selected URIs
+                    }
+                    ImageProcessingService.BROADCAST_PROCESSING_ERROR -> {
+                        isServiceProcessing = false
+                        val errorMessage = intent.getStringExtra(ImageProcessingService.EXTRA_ERROR_MESSAGE)
+                        Toast.makeText(context, "Processing error: $errorMessage", Toast.LENGTH_LONG).show()
+                        selectedUris = emptyList() // Clear selected URIs
+                    }
+                }
             }
-        } else {
-            Log.w("PhotoCombinerApp", "POST_NOTIFICATIONS permission denied.")
-            // Handle permission denial (e.g., show a rationale to the user)
-            // Potentially clear selectedUris if you don't want to proceed without notifications
-            // selectedUris = emptyList() // Optional: reset if notification is critical
         }
     }
 
+    // Register and unregister the receiver using DisposableEffect
+    DisposableEffect(Unit) {
+        val intentFilter = IntentFilter().apply {
+            addAction(ImageProcessingService.BROADCAST_PROCESSING_COMPLETE)
+            addAction(ImageProcessingService.BROADCAST_PROCESSING_ERROR)
+        }
+        LocalBroadcastManager.getInstance(context).registerReceiver(processingStateReceiver, intentFilter)
+        Log.d("PhotoCombinerApp", "BroadcastReceiver registered.")
+
+        onDispose {
+            LocalBroadcastManager.getInstance(context).unregisterReceiver(processingStateReceiver)
+            Log.d("PhotoCombinerApp", "BroadcastReceiver unregistered.")
+        }
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(), // Explicitly state the contract
+        onResult = { isGranted: Boolean -> // Explicitly type the lambda parameter
+            if (isGranted) {
+                Log.d("PhotoCombinerApp", "POST_NOTIFICATIONS permission granted.")
+                // If URIs were selected (meaning picker ran, then permission was asked),
+                // and now granted, start service.
+                if (selectedUris.isNotEmpty() && (averageImageChecked || medianImageChecked)) {
+                    startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
+                    isServiceProcessing = true // Service is definitely starting or attempting to
+                } else {
+                    // This case might occur if permission was requested for some other reason
+                    // or if the state changed before service could start.
+                    Log.w("PhotoCombinerApp", "Permission granted, but selectedUris is empty or no processing type. Not starting service.")
+                    // isServiceProcessing should ideally not have been set to true if we reached here without starting.
+                }
+            } else {
+                Log.w("PhotoCombinerApp", "POST_NOTIFICATIONS permission denied.")
+                isServiceProcessing = false // Crucial: update state if permission denied and service won't start
+                Toast.makeText(context, "Notification permission denied. Processing cannot start.", Toast.LENGTH_LONG).show()
+            }
+        }
+    )
+
+
     val pickMultipleMedia =
-        rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(500)) { urisFromPicker ->
-            if (urisFromPicker.isNotEmpty()) {
-                selectedUris = urisFromPicker // <--- UPDATE THE STATE HERE
+        rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.PickMultipleVisualMedia(500)
+        ) { urisFromPicker: List<Uri>? ->
+            // ... (your pickMultipleMedia logic as discussed before) ...
+            if (!urisFromPicker.isNullOrEmpty()) {
+                selectedUris = urisFromPicker
 
                 if (!averageImageChecked && !medianImageChecked) {
                     Log.i("PhotoCombinerApp", "No processing type selected.")
-                    // selectedUris = emptyList() // Optionally clear if no processing type
                     return@rememberLauncherForActivityResult
                 }
 
-                // Permission check and service start logic now happens here,
-                // AFTER urisFromPicker has populated selectedUris.
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     when (context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)) {
                         android.content.pm.PackageManager.PERMISSION_GRANTED -> {
-                            Log.d("PhotoCombinerApp", "Notification permission already granted.")
                             startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
                             isServiceProcessing = true
                         }
                         else -> {
-                            // Request permission. The launcher's callback will handle starting the service if granted.
+                            // Only set isServiceProcessing to true IF we know we are trying to start
+                            // The actual start will happen in notificationPermissionLauncher callback
                             notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                            // We don't start the service here directly; it's handled by the permission result.
-                            // We can set isServiceProcessing optimistically or wait.
-                            // For a better UX, only set isServiceProcessing if/when service actually starts.
-                            // Let's assume for now the user will grant it, or they'll be prompted again.
                         }
                     }
                 } else {
-                    // No runtime permission needed for notifications before Android 13
                     startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
                     isServiceProcessing = true
                 }
             } else {
-                Log.d("PhotoPicker", "No media selected")
-                selectedUris = emptyList() // Clear if no media selected
+                selectedUris = emptyList()
             }
         }
-
-    // This effect is more for observing service completion, which is a more advanced topic.
-    // For now, isServiceProcessing is manually reset or relies on the service stopping.
-    // A better approach would be LocalBroadcastManager or similar to get actual service status.
-    // LaunchedEffect(isServiceProcessing) { ... }
 
     Column(
         modifier = modifier
@@ -192,18 +232,6 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
 
         Button(
             onClick = {
-                // Now, the button's primary role is to launch the media picker.
-                // The logic to check permissions and start the service
-                // is inside the pickMultipleMedia launcher's callback,
-                // after 'selectedUris' is populated.
-
-                // If images have ALREADY been selected (e.g. permission was denied, then granted later,
-                // and user clicks button again without re-picking), we might want to directly
-                // try starting the service. However, the current flow is:
-                // Button -> Picker -> Picker Callback -> Permission Check -> Service Start.
-                // This is generally a cleaner flow.
-
-                // So, the button just launches the picker.
                 pickMultipleMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             },
             enabled = !isServiceProcessing && (averageImageChecked || medianImageChecked)
@@ -214,8 +242,6 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
         if (isServiceProcessing) {
             Spacer(modifier = Modifier.height(8.dp))
             Text("Check notification for progress.", color = Color.Gray)
-            // You might also want a way to reset 'isServiceProcessing' when the service actually finishes.
-            // For now, it's a simple flag.
         }
     }
 }

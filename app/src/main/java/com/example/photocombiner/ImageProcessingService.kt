@@ -22,6 +22,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.collections.map
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 
 class ImageProcessingService : Service() {
 
@@ -37,6 +38,9 @@ class ImageProcessingService : Service() {
         const val EXTRA_IMAGE_URIS = "com.example.photocombiner.extra.IMAGE_URIS"
         const val EXTRA_PROCESS_AVERAGE = "com.example.photocombiner.extra.PROCESS_AVERAGE"
         const val EXTRA_PROCESS_MEDIAN = "com.example.photocombiner.extra.PROCESS_MEDIAN"
+        const val BROADCAST_PROCESSING_COMPLETE = "com.example.photocombiner.broadcast.PROCESSING_COMPLETE"
+        const val BROADCAST_PROCESSING_ERROR = "com.example.photocombiner.broadcast.PROCESSING_ERROR"
+        const val EXTRA_ERROR_MESSAGE = "com.example.photocombiner.extra.ERROR_MESSAGE"
     }
 
     override fun onCreate() {
@@ -66,6 +70,8 @@ class ImageProcessingService : Service() {
             Log.d("ImageProcessingService", "Timestamp POST Service.startForeground: ${System.currentTimeMillis()}")
 
             serviceScope.launch {
+                var success = false // Track success
+                var errorMessage: String? = null
                 try {
                     Log.d("ImageProcessingService", "Processing ${imageUris.size} images. Average: $processAverage, Median: $processMedian")
                     // Your existing processImages logic will be called here
@@ -117,19 +123,30 @@ class ImageProcessingService : Service() {
                         Log.d("ImageProcessingService", "Median processing done.")
                     }
 
-                    updateNotification("Processing Complete", 100, false, true) // Final success notification
+                    success = true
+                    updateNotification("Processing Complete", 100, false, true)
                     Log.d("ImageProcessingService", "All processing finished successfully.")
 
                 } catch (e: Exception) {
                     Log.e("ImageProcessingService", "Error during processing: ${e.message}", e)
-                    updateNotification("Processing Error", 0, false, true, isError = true) // Error notification
+                    errorMessage = e.message ?: "Unknown processing error"
+                    updateNotification("Processing Error: $errorMessage", 0, false, true, isError = true)
+                    success = false
                 } finally {
-                    Log.d("ImageProcessingService", "Stopping foreground service and self.")
-                    // Don't call stopForeground(true) immediately if you want the "Complete" or "Error" notification to stay a bit
-                    // The system will remove it if stopSelf() is called and no new startForeground is issued.
-                    // Or, you can post a final non-ongoing notification.
-                    // For simplicity, we'll let it be removed when service stops.
-                    withContext(Dispatchers.Main) { // Ensure stopSelf is called on the main thread
+                    Log.d("ImageProcessingService", "Processing ended. Success: $success")
+
+                    // Send broadcast based on outcome
+                    val broadcastIntent = Intent()
+                    if (success) {
+                        broadcastIntent.action = BROADCAST_PROCESSING_COMPLETE
+                    } else {
+                        broadcastIntent.action = BROADCAST_PROCESSING_ERROR
+                        broadcastIntent.putExtra(EXTRA_ERROR_MESSAGE, errorMessage)
+                    }
+                    LocalBroadcastManager.getInstance(applicationContext).sendBroadcast(broadcastIntent)
+                    Log.d("ImageProcessingService", "Sent broadcast: ${broadcastIntent.action}")
+
+                    withContext(Dispatchers.Main) {
                         stopSelf()
                     }
                 }
