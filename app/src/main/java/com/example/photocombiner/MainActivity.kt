@@ -511,7 +511,6 @@ private fun copyExifData(
             ExifInterface.TAG_MODEL,
             ExifInterface.TAG_ORIENTATION,
             ExifInterface.TAG_F_NUMBER,
-            ExifInterface.TAG_ISO_SPEED_RATINGS,
             ExifInterface.TAG_EXPOSURE_TIME,
             ExifInterface.TAG_FLASH,
             ExifInterface.TAG_FOCAL_LENGTH,
