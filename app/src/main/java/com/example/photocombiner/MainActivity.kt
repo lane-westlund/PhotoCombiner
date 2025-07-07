@@ -96,6 +96,7 @@ class MainActivity : ComponentActivity() {
 fun PhotoCombinerApp(modifier: Modifier = Modifier) {
     var averageImageChecked by remember { mutableStateOf(false) }
     var medianImageChecked by remember { mutableStateOf(false) }
+    var modalImageChecked by remember { mutableStateOf(false) }
     var isServiceProcessing by remember { mutableStateOf(false) }
     var selectedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
 
@@ -150,7 +151,7 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
                 // If URIs were selected (meaning picker ran, then permission was asked),
                 // and now granted, start service.
                 if (selectedUris.isNotEmpty() && (averageImageChecked || medianImageChecked)) {
-                    startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
+                    startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked, modalImageChecked)
                     isServiceProcessing = true // Service is definitely starting or attempting to
                 } else {
                     // This case might occur if permission was requested for some other reason
@@ -175,15 +176,16 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
             if (!urisFromPicker.isNullOrEmpty()) {
                 selectedUris = urisFromPicker
 
-                if (!averageImageChecked && !medianImageChecked) {
+                if (!averageImageChecked && !medianImageChecked && !modalImageChecked) {
                     Log.i("PhotoCombinerApp", "No processing type selected.")
-                    return@rememberLauncherForActivityResult
+                Toast.makeText(context, "Please select at least one processing type.", Toast.LENGTH_SHORT).show()
+                return@rememberLauncherForActivityResult
                 }
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     when (context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)) {
                         android.content.pm.PackageManager.PERMISSION_GRANTED -> {
-                            startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
+                            startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked, modalImageChecked)
                             isServiceProcessing = true
                         }
                         else -> {
@@ -193,7 +195,7 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
                         }
                     }
                 } else {
-                    startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked)
+                    startImageProcessingService(context, selectedUris, averageImageChecked, medianImageChecked, modalImageChecked)
                     isServiceProcessing = true
                 }
             } else {
@@ -228,13 +230,24 @@ fun PhotoCombinerApp(modifier: Modifier = Modifier) {
             Spacer(modifier = Modifier.width(8.dp))
             Text("Median Image")
         }
+        Spacer(modifier = Modifier.height(8.dp)) // <-- Spacer before new checkbox
+
+        Row(verticalAlignment = Alignment.CenterVertically) { // <-- NEW Checkbox for Modal
+            Checkbox(
+                checked = modalImageChecked,
+                onCheckedChange = { if (!isServiceProcessing) modalImageChecked = it },
+                enabled = !isServiceProcessing
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Modal Image")
+        }
         Spacer(modifier = Modifier.height(16.dp))
 
         Button(
             onClick = {
                 pickMultipleMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             },
-            enabled = !isServiceProcessing && (averageImageChecked || medianImageChecked)
+            enabled = !isServiceProcessing && (averageImageChecked || medianImageChecked || modalImageChecked)
         ) {
             Text(if (isServiceProcessing) "Processing in Background..." else "Load Images & Start Processing")
         }
@@ -252,13 +265,15 @@ private fun startImageProcessingService(
     context: Context,
     imageUris: List<Uri>,
     processAverage: Boolean,
-    processMedian: Boolean
+    processMedian: Boolean,
+    processModal: Boolean
 ) {
     val intent = Intent(context, ImageProcessingService::class.java).apply {
         action = ImageProcessingService.ACTION_START_PROCESSING
         putStringArrayListExtra(ImageProcessingService.EXTRA_IMAGE_URIS, ArrayList(imageUris.map { it.toString() }))
         putExtra(ImageProcessingService.EXTRA_PROCESS_AVERAGE, processAverage)
         putExtra(ImageProcessingService.EXTRA_PROCESS_MEDIAN, processMedian)
+        putExtra(ImageProcessingService.EXTRA_PROCESS_MODAL, processModal)
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         context.startForegroundService(intent)
@@ -268,143 +283,219 @@ private fun startImageProcessingService(
     Log.d("PhotoCombinerApp", "Attempted to start ImageProcessingService.")
 }
 
-suspend fun processImages(
+fun processImages(
     context: Context,
     uris: List<Uri>,
-    processAverage: Boolean, // True if this call is for averaging
-    processMedian: Boolean,  // True if this call is for median
-    onProgressUpdate: (Float) -> Unit
+    processAverage: Boolean,
+    processMedian: Boolean,
+    processModal: Boolean, // <-- NEW
+    onProgressUpdate: (overallProgress: Float, operationName: String, operationProgress: Float) -> Unit,
+    onOperationStart: (operationName: String) -> Unit // Callback when a new operation (avg, med, mod) starts
 ) {
-    Log.d("ImageProcessing", "Processing. Average: $processAverage, Median: $processMedian")
-    onProgressUpdate(0f) // Start progress for this operation at 0%
-
-    if (uris.isEmpty()) {
-        Log.w("ImageProcessing", "No URIs provided.")
-        onProgressUpdate(1f) // Indicate completion (or error state)
-        return
-    }
-    val firstImageUriForExif: Uri? = uris.firstOrNull()
-
-    // Load bitmaps from URIs
-    val bitmaps: List<Bitmap> = uris.mapNotNull { uri ->
+    Log.d("ImageProcessing", "Loading bitmaps...")
+    // ... (your existing bitmap loading logic from uris) ...
+    val bitmaps = uris.mapNotNull { uri ->
         try {
             context.contentResolver.openInputStream(uri)?.use { inputStream ->
                 BitmapFactory.decodeStream(inputStream)
             }
         } catch (e: Exception) {
             Log.e("ImageProcessing", "Error loading bitmap from URI: $uri", e)
-            null // Return null if a bitmap fails to load, mapNotNull will filter it out
+            null
         }
     }
-    if (bitmaps.isEmpty()) { /* ... call onProgressUpdate(1f) and return ... */ }
+
+    if (bitmaps.isEmpty()) {
+        Log.e("ImageProcessing", "No bitmaps loaded or all failed.")
+        onProgressUpdate(1f, "Error", 1f) // Signal completion with error
+        return
+    }
+
+    // --- Dimension Check (ensure all bitmaps have the same dimensions) ---
     val firstBitmap = bitmaps.first()
     val width = firstBitmap.width
     val height = firstBitmap.height
-    val totalPixels = width * height.toFloat()
-    // ... (dimension check, call onProgressUpdate(1f) and return on error) ...
+    if (bitmaps.any { it.width != width || it.height != height }) {
+        Log.e("ImageProcessing", "All images must have the same dimensions.")
+        onProgressUpdate(1f, "Error", 1f) // Signal completion with error
+        return
+    }
+    val firstImageUriForExif = uris.firstOrNull() // For saving EXIF
 
+    val totalOperations = listOf(processAverage, processMedian, processModal).count { it }
+    var completedOperations = 0
 
+    val calculateOverallProgress = { operationProgress: Float ->
+        (completedOperations.toFloat() / totalOperations) + (operationProgress / totalOperations)
+    }
+
+    // --- Process Average ---
     if (processAverage) {
+        onOperationStart("Average Image")
         Log.d("ImageProcessing", "Starting average image calculation...")
         val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        // ... (your existing averaging pixel logic) ...
+        // Inside your loops for average:
+        // onProgressUpdate(calculateOverallProgress(pixelsProcessed / totalPixels), "Averaging", pixelsProcessed / totalPixels)
         var pixelsProcessed = 0f
-
+        val totalPixels = width * height.toFloat()
         for (x in 0 until width) {
             for (y in 0 until height) {
-                // ... (averaging pixel logic as before) ...
-                var sumRed = 0f
-                var sumGreen = 0f
-                var sumBlue = 0f
-                var sumAlpha = 0f
-
+                var sumRed = 0f; var sumGreen = 0f; var sumBlue = 0f; var sumAlpha = 0f
                 for (bitmap in bitmaps) {
                     val pixel = bitmap.getPixel(x, y)
-                    sumAlpha += AndroidGraphicsColor.alpha(pixel).toFloat()
-                    sumRed += AndroidGraphicsColor.red(pixel).toFloat()
-                    sumGreen += AndroidGraphicsColor.green(pixel).toFloat()
-                    sumBlue += AndroidGraphicsColor.blue(pixel).toFloat()
+                    sumAlpha += android.graphics.Color.alpha(pixel).toFloat()
+                    sumRed += android.graphics.Color.red(pixel).toFloat()
+                    sumGreen += android.graphics.Color.green(pixel).toFloat()
+                    sumBlue += android.graphics.Color.blue(pixel).toFloat()
                 }
-
                 val numImages = bitmaps.size
-                val avgAlpha = (sumAlpha / numImages).toInt().coerceIn(0, 255)
-                val avgRed = (sumRed / numImages).toInt().coerceIn(0, 255)
-                val avgGreen = (sumGreen / numImages).toInt().coerceIn(0, 255)
-                val avgBlue = (sumBlue / numImages).toInt().coerceIn(0, 255)
-
-                resultBitmap.setPixel(x, y, AndroidGraphicsColor.argb(avgAlpha, avgRed, avgGreen, avgBlue))
-
+                resultBitmap.setPixel(x, y, android.graphics.Color.argb(
+                    (sumAlpha / numImages).toInt().coerceIn(0, 255),
+                    (sumRed / numImages).toInt().coerceIn(0, 255),
+                    (sumGreen / numImages).toInt().coerceIn(0, 255),
+                    (sumBlue / numImages).toInt().coerceIn(0, 255)
+                ))
                 pixelsProcessed++
-                if (y == height - 1 || pixelsProcessed.toInt() % 1000 == 0) {
-                    onProgressUpdate(pixelsProcessed / totalPixels)
+                if (x == width -1 && y == height -1 || pixelsProcessed.toInt() % 1000 == 0) {
+                    onProgressUpdate(calculateOverallProgress(pixelsProcessed / totalPixels), "Average Image", pixelsProcessed / totalPixels)
                 }
             }
         }
+        saveBitmap(context, resultBitmap, "averaged_image_${System.currentTimeMillis()}.jpg", "image/jpeg", "_average", firstImageUriForExif)
+        // resultBitmap.recycle() // Be careful with recycling if you plan to reuse source bitmaps
+        completedOperations++
         Log.d("ImageProcessing", "Average image calculation complete.")
-        val displayName = "averaged_image_${System.currentTimeMillis()}.jpg"
-        saveBitmap(context, resultBitmap, displayName, "image/jpeg", "_average", firstImageUriForExif)
-        // resultBitmap.recycle()
     }
 
+    // --- Process Median ---
     if (processMedian) {
+        onOperationStart("Median Image")
         Log.d("ImageProcessing", "Starting median image calculation...")
-        // Note: Progress for median starts from 0 here because onProgressUpdate(0f)
-        // was called at the beginning of this function invocation.
         val medianResultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        // ... (your existing median pixel logic) ...
+        // Inside your loops for median:
+        // onProgressUpdate(calculateOverallProgress(pixelsProcessedMedian / totalPixels), "Medianing", pixelsProcessedMedian / totalPixels)
         var pixelsProcessedMedian = 0f
+        val totalPixels = width * height.toFloat()
+        val redValues = mutableListOf<Int>(); val greenValues = mutableListOf<Int>()
+        val blueValues = mutableListOf<Int>(); val alphaValues = mutableListOf<Int>()
+
+        for (x in 0 until width) {
+            for (y in 0 until height) {
+                redValues.clear(); greenValues.clear(); blueValues.clear(); alphaValues.clear()
+                for (bitmap in bitmaps) {
+                    val pixel = bitmap.getPixel(x, y)
+                    alphaValues.add(android.graphics.Color.alpha(pixel))
+                    redValues.add(android.graphics.Color.red(pixel))
+                    // ... add green, blue
+                    greenValues.add(android.graphics.Color.green(pixel))
+                    blueValues.add(android.graphics.Color.blue(pixel))
+                }
+                alphaValues.sort(); redValues.sort(); greenValues.sort(); blueValues.sort()
+                val medianIndex = if (bitmaps.size % 2 == 0) (bitmaps.size / 2) - 1 else bitmaps.size / 2
+                medianResultBitmap.setPixel(x, y, android.graphics.Color.argb(
+                    alphaValues[medianIndex].coerceIn(0,255),
+                    redValues[medianIndex].coerceIn(0,255),
+                    greenValues[medianIndex].coerceIn(0,255),
+                    blueValues[medianIndex].coerceIn(0,255)
+                ))
+                pixelsProcessedMedian++
+                if (x == width -1 && y == height -1 || pixelsProcessedMedian.toInt() % 1000 == 0) {
+                    onProgressUpdate(calculateOverallProgress(pixelsProcessedMedian / totalPixels), "Median Image", pixelsProcessedMedian / totalPixels)
+                }
+            }
+        }
+        saveBitmap(context, medianResultBitmap, "median_image_${System.currentTimeMillis()}.jpg", "image/jpeg", "_median", firstImageUriForExif)
+        // medianResultBitmap.recycle()
+        completedOperations++
+        Log.d("ImageProcessing", "Median image calculation complete.")
+    }
+
+    // --- Process Modal ---
+    if (processModal) {
+        onOperationStart("Modal Image")
+        Log.d("ImageProcessing", "Starting modal image calculation...")
+        val modalResultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        var pixelsProcessedModal = 0f
+        val totalPixels = width * height.toFloat()
+
         val redValues = mutableListOf<Int>()
-        // ... (rest of median lists and logic as before) ...
         val greenValues = mutableListOf<Int>()
         val blueValues = mutableListOf<Int>()
         val alphaValues = mutableListOf<Int>()
 
         for (x in 0 until width) {
             for (y in 0 until height) {
-                redValues.clear()
-                greenValues.clear()
-                blueValues.clear()
-                alphaValues.clear()
+                redValues.clear(); greenValues.clear(); blueValues.clear(); alphaValues.clear()
 
                 for (bitmap in bitmaps) {
                     val pixel = bitmap.getPixel(x, y)
-                    alphaValues.add(AndroidGraphicsColor.alpha(pixel))
-                    redValues.add(AndroidGraphicsColor.red(pixel))
-                    greenValues.add(AndroidGraphicsColor.green(pixel))
-                    blueValues.add(AndroidGraphicsColor.blue(pixel))
+                    alphaValues.add(android.graphics.Color.alpha(pixel))
+                    redValues.add(android.graphics.Color.red(pixel))
+                    greenValues.add(android.graphics.Color.green(pixel))
+                    blueValues.add(android.graphics.Color.blue(pixel))
                 }
 
-                redValues.sort()
-                greenValues.sort()
-                blueValues.sort()
-                alphaValues.sort()
+                val modalAlpha = findMode(alphaValues)
+                val modalRed = findMode(redValues)
+                val modalGreen = findMode(greenValues)
+                val modalBlue = findMode(blueValues)
 
-                val numImages = bitmaps.size
-                val medianIndex = if (numImages % 2 == 0) (numImages / 2) - 1 else numImages / 2
+                modalResultBitmap.setPixel(x, y, android.graphics.Color.argb(
+                    modalAlpha.coerceIn(0, 255),
+                    modalRed.coerceIn(0, 255),
+                    modalGreen.coerceIn(0, 255),
+                    modalBlue.coerceIn(0, 255)
+                ))
 
-                val medAlpha = alphaValues[medianIndex].coerceIn(0, 255)
-                val medRed = redValues[medianIndex].coerceIn(0, 255)
-                val medGreen = greenValues[medianIndex].coerceIn(0, 255)
-                val medBlue = blueValues[medianIndex].coerceIn(0, 255)
-
-                medianResultBitmap.setPixel(x, y, AndroidGraphicsColor.argb(medAlpha, medRed, medGreen, medBlue))
-
-                pixelsProcessedMedian++
-                if (y == height - 1 || pixelsProcessedMedian.toInt() % 1000 == 0) {
-                    onProgressUpdate(pixelsProcessedMedian / totalPixels)
+                pixelsProcessedModal++
+                if (x == width - 1 && y == height - 1 || pixelsProcessedModal.toInt() % 1000 == 0) {
+                    onProgressUpdate(calculateOverallProgress(pixelsProcessedModal / totalPixels), "Modal Image", pixelsProcessedModal / totalPixels)
                 }
             }
         }
-        Log.d("ImageProcessing", "Median image calculation complete.")
-        val displayNameMedian = "median_image_${System.currentTimeMillis()}.jpg"
-        saveBitmap(context, medianResultBitmap, displayNameMedian, "image/jpeg", "_median", firstImageUriForExif)
-        // medianResultBitmap.recycle()
+        saveBitmap(context, modalResultBitmap, "modal_image_${System.currentTimeMillis()}.jpg", "image/jpeg", "_modal", firstImageUriForExif)
+        // modalResultBitmap.recycle()
+        completedOperations++
+        Log.d("ImageProcessing", "Modal image calculation complete.")
     }
 
-    // --- Cleanup Original Bitmaps ---
-    if (!bitmaps.all { it.isRecycled }) {
-        // ... recycle bitmaps ...
+    // --- Cleanup Original Bitmaps (if desired and not already handled) ---
+    // if (!bitmaps.all { it.isRecycled }) {
+    //     bitmaps.forEach { if (!it.isRecycled) it.recycle() }
+    //     Log.d("ImageProcessing", "Recycled source bitmaps.")
+    // }
+
+    // Ensure final progress update signals 100% completion if all selected operations are done
+    if (completedOperations == totalOperations && totalOperations > 0) {
+        onProgressUpdate(1f, "All Operations Complete", 1f)
+    } else if (totalOperations == 0) {
+        onProgressUpdate(1f, "No operations selected", 1f) // Or handle as error
     }
-    onProgressUpdate(1f) // Signal completion of THIS operation (average OR median)
-    Log.d("ImageProcessing", "Current processing step finished.")
+    Log.d("ImageProcessing", "All selected processing steps finished.")
+}
+
+// Helper function to find the mode of a list of integers
+// Tie-breaking: returns the smallest modal value if multiple modes exist.
+fun findMode(numbers: List<Int>): Int {
+    if (numbers.isEmpty()) {
+        // Decide what to do for an empty list: throw error, return default (e.g., 0 or 128)
+        // For pixel data, returning a mid-range value or black might be okay.
+        return 0 // Defaulting to 0 for missing data, adjust as needed
+    }
+
+    val frequencyMap = numbers.groupingBy { it }.eachCount()
+
+    // Find the maximum frequency.
+    val maxFrequency = frequencyMap.values.maxOrNull()
+
+    // Find all numbers that have the maximum frequency.
+    val modes = frequencyMap.filter { it.value == maxFrequency }.keys
+
+    // Tie-breaking rule: if multiple modes, return the smallest one.
+    // You could also return the largest, the first one encountered, or average them (though averaging modes is unusual).
+    return modes.minOrNull() ?: numbers.first() // Fallback to the first element if modes set is somehow empty (shouldn't happen if numbers isn't empty)
 }
 
 private fun saveBitmap(
